@@ -11,6 +11,47 @@ const TaskSchema = z.object({
   tags: z.array(z.string()).optional(),
 });
 
+// API response cache
+const cache = new Map<string, { data: any; timestamp: number }>();
+const CACHE_TTL = 30 * 1000; // 30 seconds
+
+// Exponential backoff retry
+async function fetchWithRetry(
+  url: string,
+  options: RequestInit,
+  maxRetries = 3
+): Promise<Response> {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await fetch(url, options);
+      if (response.ok || attempt === maxRetries) {
+        return response;
+      }
+      const backoffTime = Math.min(1000 * Math.pow(2, attempt - 1), 8000);
+      await new Promise(resolve => setTimeout(resolve, backoffTime));
+    } catch (error) {
+      if (attempt === maxRetries) throw error;
+    }
+  }
+  throw new Error("Max retries reached");
+}
+
+async function fetchTickTick(
+  path: string,
+  options: RequestInit,
+  session: any
+): Promise<Response> {
+  const url = `${process.env.TICKTICK_API_URL}${path}`;
+  return fetchWithRetry(url, {
+    ...options,
+    headers: {
+      ...options.headers,
+      Authorization: `Bearer ${session.accessToken}`,
+      "Content-Type": "application/json",
+    },
+  });
+}
+
 export async function GET(req: NextRequest) {
   try {
     const session = await getServerSession(authOptions);
@@ -18,8 +59,30 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    // TODO: Implement TickTick API integration
-    return NextResponse.json({ tasks: [] });
+    // Check cache
+    const cacheKey = `tasks-${session.accessToken}`;
+    const cached = cache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+      return NextResponse.json(cached.data);
+    }
+
+    const response = await fetchTickTick("/task", {
+      method: "GET",
+    }, session);
+
+    if (!response.ok) {
+      throw new Error(`TickTick API error: ${response.statusText}`);
+    }
+
+    const tasks = await response.json();
+
+    // Update cache
+    cache.set(cacheKey, {
+      data: { tasks },
+      timestamp: Date.now(),
+    });
+
+    return NextResponse.json({ tasks });
   } catch (error) {
     console.error("Error fetching tasks:", error);
     return NextResponse.json(
@@ -46,8 +109,25 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // TODO: Implement TickTick API integration
-    return NextResponse.json({ message: "Task created" }, { status: 201 });
+    const response = await fetchTickTick("/task", {
+      method: "POST",
+      body: JSON.stringify({
+        ...validatedTask.data,
+        status: 0, // 0 = not completed
+      }),
+    }, session);
+
+    if (!response.ok) {
+      throw new Error(`TickTick API error: ${response.statusText}`);
+    }
+
+    const task = await response.json();
+
+    // Invalidate cache
+    const cacheKey = `tasks-${session.accessToken}`;
+    cache.delete(cacheKey);
+
+    return NextResponse.json(task, { status: 201 });
   } catch (error) {
     console.error("Error creating task:", error);
     return NextResponse.json(
